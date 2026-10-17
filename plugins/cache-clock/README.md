@@ -18,6 +18,8 @@ Every request to the model writes the conversation to the prompt cache. If the n
 - Want the session compacted instead? Use Claude Code's own idle compaction (2.1.299 and later, on by default): a conversation of 200K+ tokens left idle for about 54 minutes is compacted before its one-hour cache expires. Turn it on or off with `Idle compaction` in `/config`, and change the 200K minimum with `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS`. The mod's own `compact` option is gone; a saved `compact` now acts as `off`.
 - `/cache-clock` prints the same line as text.
 
+Does nothing in -p / SDK sessions.
+
 The handoff is the only thing it sends to Claude: one short turn on a warm cache.
 
 ## Install
