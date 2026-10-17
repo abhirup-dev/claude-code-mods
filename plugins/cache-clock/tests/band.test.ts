@@ -9,6 +9,67 @@ test('the band draws one line', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: /cache/ } as any)).toBeDefined()
 })
 
+const BAND = { plugin: 'cache-clock', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 10 } } } as any
+const MIN = 60_000
+// The band's first piece: '◷ cache 10:00 left'
+async function cachePiece($: any) {
+  const text = (await (await $.ui.mount(BAND)).find({ type: 'Text', text: /◷/ } as any))?.text
+  return String(text).split('  ·  ')[0]
+}
+
+for (const [command, args] of [['recap', ''], ['btw', 'what word did you reply with?']]) {
+  test(`/${command} restarts the main cache clock, though no turn.step fires for it (#15)`, async ($, on) => {
+    let now = 1_000_000
+    on('clock.now', () => ({ value: now }))
+    on('ui.render', () => null)
+    on('turn.step', async function* (_$, e) { return { turnId: e.turnId, index: e.index, answer: '', toolUses: [] } as any })
+    on('command.run', () => ({ text: 'side answer' }))
+
+    // Before any main request there is nothing cached to keep warm
+    await $.command.run({ command, args } as any)
+    expect(await cachePiece($)).toBe('◷ cache: no request yet')
+
+    // A main turn starts the hour; 50 minutes later 10 are left
+    const step = $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 } as any)
+    for await (const _ of step);
+    now += 50 * MIN
+    expect(await cachePiece($)).toBe('◷ cache 10:00 left')
+
+    // The side request reads the cache: a full hour again
+    await $.command.run({ command, args } as any)
+    expect(await cachePiece($)).toBe('◷ cache 60:00 left')
+  })
+}
+
+test('a side request on a cold cache, or a bare /btw, leaves the clock alone', async ($, on) => {
+  let now = 1_000_000
+  on('clock.now', () => ({ value: now }))
+  on('ui.render', () => null)
+  on('turn.step', async function* (_$, e) { return { turnId: e.turnId, index: e.index, answer: '', toolUses: [] } as any })
+  on('command.run', () => ({ text: 'ok' }))
+  const step = $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 } as any)
+  for await (const _ of step);
+  now += 50 * MIN
+  await $.command.run({ command: 'btw', args: '  ' } as any)
+  expect(await cachePiece($)).toBe('◷ cache 10:00 left')
+  now += 20 * MIN
+  await $.command.run({ command: 'recap', args: '' } as any)
+  expect(await cachePiece($)).toBe('◷ cache cold')
+})
+
+test('another command leaves the cache clock alone', async ($, on) => {
+  let now = 1_000_000
+  on('clock.now', () => ({ value: now }))
+  on('ui.render', () => null)
+  on('turn.step', async function* (_$, e) { return { turnId: e.turnId, index: e.index, answer: '', toolUses: [] } as any })
+  on('command.run', () => ({ text: 'ok' }))
+  const step = $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 } as any)
+  for await (const _ of step);
+  now += 50 * MIN
+  await $.command.run({ command: 'cost', args: '' } as any)
+  expect(await cachePiece($)).toBe('◷ cache 10:00 left')
+})
+
 test('the warning action comes from the env var, then the old switch, then the setting', async () => {
   expect(pickAction(undefined, undefined, undefined)).toBe('handoff')
   expect(pickAction(undefined, undefined, 'off')).toBe('off')

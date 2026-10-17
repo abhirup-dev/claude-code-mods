@@ -142,6 +142,25 @@ function handoffText(file) {
   return '(' + HANDOFF_MARKER + ') The prompt cache goes cold soon and the user has not replied. While the cache is still warm, write a short handoff note to ' + file + ': the goal, what is done, what is next, open questions, and the key files. Keep it brief, and write it even if the session has been short. Do nothing else. A fresh session will start from it if the user does not come back.'
 }
 
+// A main-session request just read or wrote the cache: a full TTL again
+function restartMain(now) {
+  mainAt = now
+  warned = false
+  wentCold = false
+}
+
+// /recap and /btw send the whole conversation to the model as a side request.
+// It reads the main cache, so it keeps it warm, but it is no turn, so no
+// turn.step fires for it (#15). Only a warm cache counts: a cold one the side
+// request may not write back at the main TTL, so the band stays honest. A bare
+// /btw asks nothing and sends nothing.
+async function sideRequest($, e, next) {
+  const now = await $.clock.now()
+  const asks = e.command !== 'btw' || String(e.args ?? '').trim() !== ''
+  if (asks && mainAt && mainAt + cfg.mainTtl > now) restartMain(now)
+  return next(e)
+}
+
 // Once a second: warn near expiry, note when it goes cold, redraw the band
 async function tick($) {
   const s = snapshot(await $.clock.now())
@@ -200,9 +219,14 @@ export function register(on, options) {
   on('turn.step', async function* ($, e, next) {
     const now = await $.clock.now()
     if (e.agentId) subAt = now
-    else { mainAt = now; warned = false; wentCold = false }
+    else restartMain(now)
     yield* next(e)
   })
+
+  // /recap and /btw: a side request that keeps the main cache warm
+  // (a hook that fails is skipped and the command still runs)
+  on('command.run', { command: 'recap' }, sideRequest)
+  on('command.run', { command: 'btw' }, sideRequest)
 
   // After each turn, check which TTL the API actually used
   on('classic.Stop', async ($, e, next) => {
