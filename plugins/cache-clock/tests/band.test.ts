@@ -4,9 +4,23 @@ import { handoffPath, lastLines, pickAction, tailCommand } from '../hooks/regist
 
 test('the band draws one line', async ($, on) => {
   on('clock.now', () => ({ value: 1_000_000 }))
-  on('ui.render', () => null)
+  on('ui.render', () => ({ type: 'Text', children: [''] }) as never)
   const ui = await $.ui.mount({ plugin: 'cache-clock', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 10 } } } as any)
   expect(await ui.find({ type: 'Text', text: /cache/ } as any)).toBeDefined()
+})
+
+// Another mod's band (vercel-deploy-status, say) sits behind cache-clock in the chain
+test('the band draws the other mods\' bands under it', async ($, on) => {
+  on('clock.now', () => ({ value: 1_000_000 }))
+  let rows = -1
+  on('ui.render', { component: 'AbovePrompt' }, (_$, e: any) => {
+    rows = e.props.maxRows
+    return { type: 'Text', children: ['other band'] } as never
+  })
+  const ui = await $.ui.mount({ plugin: 'cache-clock', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 10 } } } as any)
+  expect(await ui.find({ type: 'Text', text: /cache/ } as any)).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /other band/ } as any)).toBeDefined()
+  expect(rows).toBe(9)
 })
 
 const BAND = { plugin: 'cache-clock', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 10 } } } as any
@@ -21,7 +35,7 @@ for (const [command, args] of [['recap', ''], ['btw', 'what word did you reply w
   test(`/${command} restarts the main cache clock, though no turn.step fires for it (#15)`, async ($, on) => {
     let now = 1_000_000
     on('clock.now', () => ({ value: now }))
-    on('ui.render', () => null)
+    on('ui.render', () => ({ type: 'Text', children: [''] }) as never)
     on('turn.step', async function* (_$, e) { return { turnId: e.turnId, index: e.index, answer: '', toolUses: [] } as any })
     on('command.run', () => ({ text: 'side answer' }))
 
@@ -44,7 +58,7 @@ for (const [command, args] of [['recap', ''], ['btw', 'what word did you reply w
 test('a side request on a cold cache, or a bare /btw, leaves the clock alone', async ($, on) => {
   let now = 1_000_000
   on('clock.now', () => ({ value: now }))
-  on('ui.render', () => null)
+  on('ui.render', () => ({ type: 'Text', children: [''] }) as never)
   on('turn.step', async function* (_$, e) { return { turnId: e.turnId, index: e.index, answer: '', toolUses: [] } as any })
   on('command.run', () => ({ text: 'ok' }))
   const step = $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 } as any)
@@ -60,7 +74,7 @@ test('a side request on a cold cache, or a bare /btw, leaves the clock alone', a
 test('another command leaves the cache clock alone', async ($, on) => {
   let now = 1_000_000
   on('clock.now', () => ({ value: now }))
-  on('ui.render', () => null)
+  on('ui.render', () => ({ type: 'Text', children: [''] }) as never)
   on('turn.step', async function* (_$, e) { return { turnId: e.turnId, index: e.index, answer: '', toolUses: [] } as any })
   on('command.run', () => ({ text: 'ok' }))
   const step = $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 } as any)
@@ -136,3 +150,22 @@ test('interactive session starts the timer and the command', async ($, on) => {
   expect(timers).toBe(1)
   expect(commands).toBe(1)
 })
+
+// classic.SessionStart fires before session.start, so it must not read the
+// transcript itself: in a headless session that read is a wasted tail/PowerShell spawn
+for (const isInteractive of [false, true]) {
+  test(`${isInteractive ? 'interactive' : 'headless'} session ${isInteractive ? 'reads' : 'never reads'} the transcript at start`, async ($: any, on) => {
+    mock.store(on, {})
+    mock.env(on, {})
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('clock.every', () => ({ value: undefined }) as never)
+    on('clock.now', () => ({ value: 1_000_000 }) as never)
+    on('command.register', () => ({ value: undefined }) as never)
+    let runs = 0
+    on('process.run', () => { runs += 1; return { value: { exitCode: 0, stdout: '', stderr: '' } } as never })
+    on('classic.SessionStart', () => ({}) as never)
+    await $.classic.SessionStart({ transcript_path: '/nowhere/t.jsonl' })
+    await $.session.start({ cwd: '/nowhere', surface: 'terminal', isInteractive })
+    expect(runs).toBe(isInteractive ? 1 : 0)
+  })
+}

@@ -192,6 +192,8 @@ export function register(on, options) {
     headless = e.isInteractive === false
     if (headless) return next(e)
     await loadConfig($, options)
+    // classic.SessionStart fires before this, so the transcript path is known: read the TTL here
+    await readTtl($).catch(() => undefined)
     context = (await $.session.usage()).context
     await $.command.register({ name: 'cache-clock', description: 'Print the cache countdown and context use' })
     $.clock.every(1000, () => tick($))
@@ -199,11 +201,11 @@ export function register(on, options) {
   })
 
   // On a resume, the session tells us how long ago the last answer was,
-  // so the clock picks up where it left off
+  // so the clock picks up where it left off. This fires before session.start, so
+  // it can't tell a headless session yet: session.start does the TTL read.
   on('classic.SessionStart', async ($, e, next) => {
     transcript = e.transcript_path ?? transcript
     if (e.seconds_since_last_response != null) mainAt = (await $.clock.now()) - e.seconds_since_last_response * 1000
-    if (!headless) await readTtl($)
     return next(e)
   }).catch(($, e, next) => (next.called ? undefined : next(e))) // never block the session on our error
 
@@ -243,9 +245,13 @@ export function register(on, options) {
     return next(e)
   })
 
-  // The band itself: one line above the prompt
+  // The band itself: one line above the prompt, with the other mods' bands drawn under it
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
+    // Our line takes one row, so the bands below get one fewer
+    // A band below that fails must not take ours with it
+    let below = null
+    try { below = await next({ ...e, props: { ...e.props, maxRows: Math.max(0, e.props.maxRows - 1) } }) } catch {}
     const { Box, Text } = $.ui.resolve(e)
     const s = snapshot(await $.clock.now())
     // Pieces in order of importance; drop from the end until it fits one line
@@ -258,7 +264,8 @@ export function register(on, options) {
     const SEP = '  ·  '
     while (pieces.length > 1 && pieces.map((p) => p.text).join(SEP).length > e.props.bodyColumns) pieces.pop()
     const parts = pieces.flatMap((p, i) => i ? [h(Text, { dimColor: true }, SEP), h(Text, p.style, p.text)] : [h(Text, p.style, p.text)])
-    return h(Box, {}, h(Text, { wrap: 'truncate-end' }, ...parts))
+    const line = h(Box, {}, h(Text, { wrap: 'truncate-end' }, ...parts))
+    return below ? h(Box, { flexDirection: 'column' }, line, below) : line
   })
 
   on('command.run', { command: 'cache-clock' }, async ($) => {
