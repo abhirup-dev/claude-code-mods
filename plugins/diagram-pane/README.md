@@ -1,8 +1,16 @@
 # diagram-pane
 
-A Claude Code mod that opens a side pane with a live picture of the work: every diagram Claude draws, pinned and readable, and a small map of what Claude is doing right now.
+A Claude Code mod that opens a side pane with a live picture of the work — and, since the workmap change, every pin **is a file**.
 
 ![diagram-pane: Claude adds a discount module on the left; on the right the pane has gone into the checkout.js box, its numbered steps drawn as boxes, with a change being typed into the field below](screenshot.png)
+
+## The workmap layer (0.3.0)
+
+- **File-backed pins.** Every diagram Claude draws is materialized to a plain mermaid file in `~/.claude/workmaps/<project>/`, one per pin (`01-checkout-flow.md`, `02-…`). Edit the file — you, Claude, anything — and the pane reloads it within a second. No model call, no store: the file is the truth.
+- **Folded transcripts.** Pinned mermaid blocks in the thread collapse to one line each (`▸ diagram: … — pinned`); the pin's file and the pane carry the source.
+- **Click anchors.** `click p12 "src/batch.go:88"` inside the mermaid anchors a box to code. Opening the box reads those lines into the pane — the diagram stops being the only view. Anchors ride mermaid's own `click` directive, so files stay valid mermaid anywhere.
+- **Pin/unpin.** An `unpin` button on every pin keeps the file on disk but takes it out of the pane (marked `<!-- workmap: unpinned -->`; delete the line to re-pin).
+- **A skill ships with the plugin** (`skills/workmap`) so Claude knows where the files live, edits them instead of re-emitting diagrams in chat, and writes anchors.
 
 Claude explains things with mermaid charts, but in a terminal you only see the raw code, and it scrolls away. Meanwhile the shape of the work (which files, which steps, what connects to what) lives only in Claude's context. This pane shows you both.
 
@@ -30,6 +38,8 @@ claude plugin install diagram-pane@claude-code-mods
 ```
 
 Or inside Claude Code: `/plugin marketplace add ray-amjad/claude-code-mods`, then `/plugin install diagram-pane@claude-code-mods`.
+
+This fork: `claude --plugin-dir ~/Codes/Personal/claude-code-mods/plugins/diagram-pane` (disable the marketplace install first — the tool names collide).
 
 The pane opens on its own in a terminal 144 columns or wider. Narrower than that, type `/diagram` once and it opens at any width. With fullscreen rendering it docks beside the transcript; in the classic renderer it sits above the prompt.
 

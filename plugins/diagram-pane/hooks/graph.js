@@ -201,6 +201,9 @@ function body(g, pad) {
     }
   }
   for (const e of g.edges) out.push(`${pad}${e.from} -->${e.label ? `|${quote(e.label)}|` : ''} ${e.to}`)
+  // Anchors ride mermaid's own click directive, so a pin file stays valid
+  // mermaid anywhere and the anchor survives the round trip through the tree
+  for (const n of g.nodes) if (n.anchor) out.push(`${pad}click ${n.id} "${n.anchor}"`)
   return out
 }
 

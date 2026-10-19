@@ -43,6 +43,23 @@ function titleBefore(text) {
   return pick.replace(/^#+\s*/, '').replace(/^[-*\d.]+\s+/, '').replace(/[*_`]/g, '').replace(/:$/, '').slice(0, 60)
 }
 
+// Fold pinned mermaid blocks in a transcript message to one line each. Blocks
+// whose code `isPinned` says false, and every non-mermaid fence, pass through.
+// Pure: the pane and the tests share it.
+export function foldText(markdown, isPinned) {
+  const fence = /```([\w-]*)[^\n]*\n([\s\S]*?)```/g
+  return markdown.replace(fence, (whole, lang, body, offset) => {
+    const code = body.replace(/\s+$/, '')
+    if (String(lang).toLowerCase() !== 'mermaid' || !isPinned(code)) return whole
+    let title = titleBefore(markdown.slice(0, offset))
+    if (!title) {
+      const g = parseMermaid(code)
+      title = g ? short(g.nodes.map(n => n.label).join(' / '), 40) : 'untitled'
+    }
+    return `▸ diagram: ${title} — pinned to the workmaps pane · mermaid source: the pin's file in ~/.claude/workmaps (/diagram open)`
+  })
+}
+
 // ---------------------------------------------------------------------------
 // 2. Parse a mermaid flowchart into nodes and edges
 // ---------------------------------------------------------------------------
@@ -75,6 +92,12 @@ export function parseMermaid(code) {
       else nodes.set(g.id, { id: g.id, label: g.label, box: 'round', group: true, parent: stack.at(-1) ?? null })
       stack.push(g.id)
     } else if (/^end$/.test(stmt)) stack.pop()
+    else if (/^click\b/.test(stmt)) {
+      // `click p12 "batch.go:88"` anchors a box to the code it stands for
+      const c = stmt.match(/^click\s+(\w+)(?:\s+"([^"]*)")?/)
+      const n = nodes.get(c?.[1])
+      if (n && c?.[2]) n.anchor = c[2]
+    }
     else if (!SKIP.test(stmt)) parseStatement(stmt, nodes, edges, stack.at(-1) ?? null)
   }
   if (!nodes.size) return null
@@ -103,6 +126,7 @@ function nest(flat, edges, parent) {
   for (const n of flat.values()) {
     if ((n.parent ?? null) !== parent) continue
     const node = { id: n.id, label: n.label, box: n.box }
+    if (n.anchor) node.anchor = n.anchor
     if (n.group) {
       const sub = nest(flat, edges, n.id)
       if (sub.nodes.length) node.sub = sub

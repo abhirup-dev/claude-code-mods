@@ -1,19 +1,24 @@
 // diagram-pane: a side pane that keeps a live picture of the work.
 //
 //   1. Pinned diagrams: every mermaid block or ASCII box diagram Claude writes
-//      is pinned in the pane, newest first, drawn as boxes and arrows.
+//      is pinned in the pane, newest first, drawn as boxes and arrows. Since the
+//      workmap change every pin IS a file in ~/.claude/workmaps/<project>/ —
+//      chat diagrams are materialized there on first pin, Claude (or anyone)
+//      edits the file and the pane reloads it, and `click id "file:line"`
+//      anchors open the code a box stands for, right in the pane.
 //   2. Live work map: every few turns (and on /diagram) a cheap Haiku gate asks
 //      "did the work change shape?". Only on YES does a fork of the session
 //      draw a small JSON graph of what Claude is doing right now.
 //   3. Going into a box: a number key opens that box's detail, a mermaid
 //      subgraph or one a fork of the session draws. b goes back, t to the top.
 //   4. Changing a diagram: Claude reads and changes the pane with the
-//      diagram_get and diagram_set tools, and the person can type a change
-//      into the pane itself.
+//      diagram_get and diagram_set tools, the person can type a change
+//      into the pane itself, and pinned mermaid blocks in the transcript
+//      fold to one line each.
 //
 // Claude learns what the pane shows only through those two tools.
 
-import { findDiagrams, parseMermaid, drawGraph, short } from './draw.js'
+import { findDiagrams, parseMermaid, drawGraph, foldText, short } from './draw.js'
 import { adoptIds, allIds, applyOps, boxOf, carrySubs, cleanId, levelAt, setLevel, toMermaid, uniqueIds } from './graph.js'
 
 const PANE = 'diagrams'
@@ -21,6 +26,10 @@ const TOOL_GET = 'mcp__diagram-pane__diagram_get'
 const TOOL_SET = 'mcp__diagram-pane__diagram_set'
 const HOME = { root: 'map', path: [] }
 const NOTE = 'The map is drawn after a few turns, or now with /diagram'
+// A pin file that starts with this is out of the pane but kept on disk; delete
+// the line to pin it again
+const UNPIN_MARK = '<!-- workmap: unpinned -->'
+const turnMark = t => `<!-- workmap: turn=${t} -->`
 // Set at each session.start; true for -p / SDK sessions
 let headless = false
 
@@ -46,6 +55,13 @@ const S = {
   sessionId: null,   // the session the state above belongs to
   gen: 0,            // bumped when a new session starts, so late forks drop their reply
   mapEdits: 0,       // bumped on every hand edit of the map, so a map fork that started before one drops its reply
+  cwd: '',           // the session's project directory, from session.start
+  pinDir: null,      // ~/.claude/workmaps/<project>: one mermaid file per pin
+  stamps: new Map(), // pin file name -> mtimeMs, what the file poll compares
+  editedFiles: new Set(), // pin files edited by hand this session, so the flag survives a reload
+  peek: {},          // anchor -> { path, line, lines } or { error }: code chunks already read
+  pollTimer: null,   // the 1s pin-file poll, one per process
+  viewFile: null,    // the file of the pin the view is in, so an edit that changes the code rebinds it
 }
 
 // /clear keeps the process (session.start does not fire) but starts a new
@@ -55,6 +71,7 @@ function startSession(id) {
     Object.assign(S, {
       pins: [], seen: new Set(), scanned: 0, sinceMap: 0, map: null, mapAt: 0,
       edits: {}, view: HOME, loading: new Set(), loaded: false, caughtUp: false, note: NOTE, gen: S.gen + 1,
+      stamps: new Map(), editedFiles: new Set(), peek: {}, viewFile: null,
     })
   }
   const changed = S.sessionId !== id
@@ -70,6 +87,12 @@ export function register(on, options) {
   on('session.start', async ($, e, next) => {
     // Set at each session.start. In -p / SDK sessions there is no pane to draw into
     headless = e.isInteractive === false
+    S.cwd = e.cwd || ''
+    if (!headless) {
+      const home = await $.env.get('HOME')
+      if (home) S.pinDir = `${home}/.claude/workmaps/${slugOf(S.cwd)}`
+      startPolling($)
+    }
     if (headless) return next(e)
     // Open the pane right away. Unasked, it is placed on a wide terminal (144+ columns);
     // /diagram opens it at any width.
@@ -137,6 +160,7 @@ export function register(on, options) {
       await sync($)
       const text = setDiagram(resolveTarget(String(e.target || 'view')), e)
       await saveSaved($)
+      await persistPins($)
       if (!(await $.ui.panes()).some(p => p.id === PANE)) await $.ui.open({ id: PANE, title: 'Diagrams' })
       await redraw($)
       return { result: text }
@@ -144,6 +168,15 @@ export function register(on, options) {
       return { deny: 'diagram_set: ' + err.message }
     }
   }).catch(() => ({ deny: 'diagram_set failed; the pane is unchanged.' }))
+
+  // Transcript folding: a pinned mermaid block draws as one line; its pin file
+  // and the pane carry the source, so the thread stops scrolling walls of code
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
+    const text = e.props?.text
+    if (headless || typeof text !== 'string' || !text.includes('```mermaid')) return next(e)
+    const folded = foldText(text, code => S.seen.has(code))
+    return folded === text ? next(e) : next({ ...e, props: { ...e.props, text: folded } })
+  })
 
   // The pane itself: lines of Text, rows of Buttons, and one Input
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -181,13 +214,14 @@ async function sync($) {
   const messages = await $.session.messages()
   S.turn = turnsIn(messages)
   await loadSaved($)
-  pinNewDiagrams(messages, S.maxPins)
+  await reloadPins($)
+  await pinNewDiagrams($, messages, S.maxPins)
   if (fresh) await redraw($)
   return messages
 }
 
 // ---------------------------------------------------------------------------
-// Pinned diagrams
+// Pinned diagrams: files in ~/.claude/workmaps/<project>, one per pin
 // ---------------------------------------------------------------------------
 
 // A turn is a prompt the user typed (tool results also arrive as user messages)
@@ -195,25 +229,157 @@ function turnsIn(messages) {
   return messages.filter(m => m.role === 'user' && m.text && !m.toolResults?.length).length
 }
 
-function pinNewDiagrams(messages, maxPins) {
+// The pin directory's last path piece, slugified: one project, one folder
+const slugOf = cwd => {
+  const base = (String(cwd).split(/[\\/]/).filter(Boolean).pop() || 'default')
+    .toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
+  return base.slice(0, 40) || 'default'
+}
+
+// A pin file: a title heading, the turn it was pinned at, and the diagram itself
+function pinFileText(title, turn, code, kind) {
+  return `# ${title || 'untitled diagram'}\n\n${turnMark(turn)}\n\n\`\`\`${kind === 'ascii' ? 'text' : 'mermaid'}\n${code}\n\`\`\`\n`
+}
+
+// Rebuild S.pins from the pin directory. Files marked unpinned are skipped, but
+// their diagrams count as seen so the transcript scan does not re-pin them.
+async function reloadPins($) {
+  if (!S.pinDir) return
+  const old = S.pins
+  const pins = []
+  S.stamps = new Map()
+  let entries = []
+  try { entries = await $.fs.list(S.pinDir) } catch { return } // no directory yet: nothing pinned
+  for (const entry of entries) {
+    if (entry.kind !== 'file' || !/\.md$/.test(entry.name)) continue
+    const file = `${S.pinDir}/${entry.name}`
+    S.stamps.set(entry.name, entry.mtimeMs)
+    let text = ''
+    try { text = await $.fs.read(file) } catch { continue }
+    if (text.startsWith(UNPIN_MARK)) {
+      for (const d of findDiagrams(text)) S.seen.add(d.code)
+      continue
+    }
+    const d = findDiagrams(text)[0]
+    if (!d) continue
+    const title = (/^#\s+(.+)$/m.exec(text) || [])[1]?.trim() || d.title
+    const turn = Number((/turn=(\d+)/.exec(text) || [])[1]) || 0
+    const wasOld = old.find(p => p.file === file)
+    const edit = S.edits[d.code]
+    const graph = edit?.graph || (d.kind === 'mermaid' ? parseMermaid(d.code) : null)
+    pins.push({
+      ...d, title: edit?.title || title, graph,
+      turn, edited: edit ? true : S.editedFiles.has(file) || Boolean(wasOld?.edited),
+      file, name: entry.name, dirty: false,
+    })
+  }
+  // Highest number first: the pane shows the newest pins at the top
+  pins.sort((a, b) => b.name.localeCompare(a.name))
+  S.pins = pins.slice(0, S.maxPins)
+  rebindView()
+}
+
+// A reloaded pin gets a new code (its file was edited): keep the view in its file
+function rebindView() {
+  const v = S.view
+  if (v.root !== 'pin' || pinOf(v.code)) return
+  const byFile = S.pins.find(p => p.file && p.file === S.viewFile)
+  if (byFile) S.view = { ...v, code: byFile.code }
+}
+
+// Pin what the transcript has that is new. With a pin directory every new
+// diagram is written to a file first, so chat-created and file-created pins are
+// one population; without one (headless, no HOME) pins stay in memory as before.
+async function pinNewDiagrams($, messages, maxPins) {
   if (messages.length < S.scanned) S.scanned = 0 // compacted: rescan, `seen` stops repeats
+  const fresh = []
   messages.forEach((m, i) => {
     if (i < S.scanned || m.role !== 'assistant') return
     for (const d of findDiagrams(m.text)) {
-      if (S.seen.has(d.code)) continue
+      if (S.seen.has(d.code) || S.pins.some(p => p.code === d.code)) {
+        S.seen.add(d.code)
+        continue
+      }
       S.seen.add(d.code)
-      // An edited pin comes back as edited; else parse mermaid flowcharts into a
-      // graph, and show anything else as written
-      const edit = S.edits[d.code]
-      const graph = edit?.graph || (d.kind === 'mermaid' ? parseMermaid(d.code) : null)
-      S.pins.unshift({ ...d, title: edit?.title || d.title, graph, edited: Boolean(edit), turn: turnsIn(messages.slice(0, i)) })
+      fresh.push({ ...d, turn: turnsIn(messages.slice(0, i)) })
     }
   })
   S.scanned = messages.length
-  S.pins.length = Math.min(S.pins.length, maxPins)
+  if (!fresh.length) { S.pins.length = Math.min(S.pins.length, maxPins); return }
+  if (!S.pinDir) {
+    for (const d of fresh) {
+      const edit = S.edits[d.code]
+      const graph = edit?.graph || (d.kind === 'mermaid' ? parseMermaid(d.code) : null)
+      S.pins.unshift({ ...d, title: edit?.title || d.title, graph, edited: Boolean(edit), turn: d.turn, file: null, name: null, dirty: false })
+    }
+    S.pins.length = Math.min(S.pins.length, maxPins)
+    return
+  }
+  let wrote = false
+  for (const d of fresh) {
+    try {
+      // Numbers continue past unpinned files, so a re-pinned diagram never collides
+      const taken = new Set([...S.stamps.keys()].map(n => ((/^(\d+)/.exec(n) || [])[1])).filter(Boolean))
+      let n = 1
+      while (taken.has(String(n).padStart(2, '0'))) n += 1
+      const name = `${String(n).padStart(2, '0')}-${slugOf(d.title || 'diagram')}.md`
+      await $.fs.write(`${S.pinDir}/${name}`, pinFileText(d.title || '', d.turn, d.code, d.kind))
+      S.stamps.set(name, -1) // unknown until the next list; forces the poll to look
+      wrote = true
+    } catch (err) {
+      try { $.ui.log('workmap: could not write a pin file: ' + err.message) } catch { /* headless */ }
+    }
+  }
+  if (wrote) await reloadPins($)
+}
+
+// Pins changed through diagram_set or the pane's input write their file back,
+// so the file is always the truth the pane shows
+async function persistPins($) {
+  if (!S.pinDir) return
+  for (const pin of S.pins) {
+    if (!pin.dirty) continue
+    try {
+      const code = pin.graph ? toMermaid(pin.graph) : pin.code
+      const file = pin.file || `${S.pinDir}/${pin.name || '00-diagram.md'}`
+      await $.fs.write(file, pinFileText(pin.title || '', pin.turn || S.turn, code, pin.graph ? 'mermaid' : pin.kind))
+      if (pin.graph) pin.kind = 'mermaid'
+      pin.code = code
+      S.seen.add(code)
+      pin.file = file
+      S.editedFiles.add(file)
+      pin.dirty = false
+      pin.edited = true
+      S.stamps.set(pin.name || file.split('/').pop(), -1)
+      if (S.viewFile === file) S.view = { ...S.view, code }
+    } catch (err) {
+      try { $.ui.log('workmap: could not write the pin file: ' + err.message) } catch { /* headless */ }
+    }
+  }
 }
 
 const pinOf = code => S.pins.find(p => p.code === code)
+
+// One file poll per process: reload the pins when the directory changes under us
+function startPolling($) {
+  if (S.pollTimer) return
+  try {
+    S.pollTimer = $.clock.every(1000, () => { pollFiles($).catch(() => {}) })
+  } catch {
+    // No clock on this host: sync() still refreshes the pins every turn
+  }
+}
+
+async function pollFiles($) {
+  if (!S.pinDir || S.busy) return
+  let entries = []
+  try { entries = await $.fs.list(S.pinDir) } catch { return }
+  const stamps = new Map(entries.filter(e => e.kind === 'file' && /\.md$/.test(e.name)).map(e => [e.name, e.mtimeMs]))
+  const same = stamps.size === S.stamps.size && [...stamps].every(([n, t]) => S.stamps.get(n) === t)
+  if (same) return
+  await reloadPins($)
+  await redraw($)
+}
 
 // ---------------------------------------------------------------------------
 // Live work map: the gate, then the fork
@@ -430,7 +596,17 @@ function actions($) {
     drill: id => drill($, id),
     back: () => go(S.view.path.length ? { ...S.view, path: S.view.path.slice(0, -1) } : HOME),
     top: () => go(HOME),
-    openPin: code => go({ root: 'pin', code, path: [] }),
+    openPin: code => { S.viewFile = pinOf(code)?.file || null; go({ root: 'pin', code, path: [] }) },
+    unpin: async file => {
+      try {
+        const text = await $.fs.read(file)
+        if (!text.startsWith(UNPIN_MARK)) await $.fs.write(file, `${UNPIN_MARK}\n${text}`)
+        await reloadPins($)
+      } catch (err) {
+        try { $.ui.log('workmap unpin: ' + err.message) } catch { /* headless */ }
+      }
+      await redraw($)
+    },
     edit: text => editByFork($, text),
     // A surface that cannot move the focus leaves the field to Tab or a click
     typeChange: () => $.ui.focus({ requestId: PANE, key: inputKey() }).catch(() => {}),
@@ -445,7 +621,33 @@ async function drill($, id) {
   S.view = { ...S.view, path: [...S.view.path, id] }
   await redraw($)
   await saveSaved($)
-  if (!node.sub) await expand($, S.view)
+  if (!node.sub) {
+    // An anchored box shows the code it stands for; an unanchored one gets a
+    // fork-drawn detail
+    if (node.anchor) await peek($, node.anchor)
+    else await expand($, S.view)
+  }
+}
+
+// Read the lines an anchor points at: `batch.go:88` — absolute, or relative to
+// the session's directory — with line numbers, kept in S.peek
+async function peek($, anchor) {
+  const m = /^(.*?)(?::(\d+))?$/.exec(anchor) || []
+  const path = m[1] || anchor
+  const line = Math.max(1, Number(m[2]) || 1)
+  const abs = path.startsWith('/') ? path : `${S.cwd}/${path}`
+  if (!S.peek[anchor]) {
+    try {
+      const text = await $.fs.read(abs)
+      const lines = text.split('\n')
+      const from = Math.max(1, line - 7)
+      const to = Math.min(lines.length, from + 14)
+      S.peek[anchor] = { path, line, lines: lines.slice(from - 1, to).map((l, i) => `${String(from + i).padStart(4, ' ')} │ ${l}`.replace(/\s+$/, '')) }
+    } catch (err) {
+      S.peek[anchor] = { path, line, error: err.message }
+    }
+    await redraw($)
+  }
 }
 
 const DETAIL_PROMPT = (where, parent, node) => `${SIDE}
@@ -508,7 +710,9 @@ const TOOLS = [
     description:
       "Read what the user's diagram side pane shows: the live work map, the diagrams pinned from your replies, and which box " +
       'the user has opened. Each comes back as mermaid with stable node ids; a subgraph is a box with a detail diagram inside ' +
-      'that the user can open. Call this when the user talks about "the diagram", "the map", a box or a pin, and before ' +
+      'that the user can open. Every pinned diagram is also a plain mermaid file in ~/.claude/workmaps/<project>/ — the reply ' +
+      'names each pin\'s file: to change a pin, edit its file directly instead of writing a new diagram in chat. ' +
+      'Call this when the user talks about "the diagram", "the map", a box or a pin, and before ' +
       'diagram_set. The user can change diagrams from the pane too, so read again instead of trusting an earlier copy.',
     inputSchema: { type: 'object', properties: {} },
     isDeferred: false,
@@ -566,6 +770,8 @@ export function describe() {
   }
   S.pins.forEach((p, i) => {
     out.push(`\n## pin:${i + 1}: "${p.title || 'untitled'}" (turn ${p.turn}${p.edited ? ', edited' : ''})`)
+    if (p.file) out.push(`file: ${p.file} — edit this file to change the pin (plain mermaid; ` +
+      'click id "path:line" lines anchor a box to code); the pane reloads it within a second')
     if (p.graph) out.push(`\`\`\`mermaid\n${toMermaid(p.graph)}\n\`\`\``)
     else out.push(`Not a flowchart, shown as written (mermaid in diagram_set replaces it with one):\n\`\`\`${p.kind === 'mermaid' ? 'mermaid' : 'text'}\n${p.code}\n\`\`\``)
   })
@@ -636,7 +842,8 @@ export function setDiagram(view, input) {
     `\`\`\`mermaid\n${toMermaid(next)}\n\`\`\``
 }
 
-// Store a changed tree as the map or as the pin it came from
+// Store a changed tree as the map or as the pin it came from. A changed pin
+// is marked dirty: persistPins writes it to its file, the thing the pane trusts
 function commitRoot(view, graph, { edited = false, title }) {
   if (view.root === 'map') {
     S.map = {
@@ -652,6 +859,7 @@ function commitRoot(view, graph, { edited = false, title }) {
   if (!pin) throw new Error('that pin is no longer in the pane')
   pin.graph = graph
   if (title) pin.title = title
+  pin.dirty = true
   if (edited || pin.edited) {
     pin.edited = true
     S.edits[pin.code] = { graph, title: pin.title }
@@ -695,6 +903,7 @@ async function editByFork($, text) {
     if (!fenced && start < 0) throw new Error('the reply had no flowchart')
     const code = fenced ? fenced[1] : r.text.slice(start)
     setDiagram({ ...view, path: [] }, { path: view.path, mermaid: code })
+    await persistPins($)
     S.note = `changed: ${short(text, 40)}`
     await saveSaved($)
   } catch (err) {
@@ -715,7 +924,7 @@ function marked(graph, keys = true) {
   return {
     nodes: graph.nodes.map((n, i) => ({
       ...n,
-      label: (keys && i < 9 ? `${i + 1}·` : '') + (n.now ? '▶ ' : '') + n.label + (n.sub ? ' ▸' : ''),
+      label: (keys && i < 9 ? `${i + 1}·` : '') + (n.now ? '▶ ' : '') + n.label + (n.sub ? ' ▸' : '') + (n.anchor ? ' ⚓' : ''),
     })),
     edges: graph.edges,
   }
@@ -727,7 +936,7 @@ function nodeButtons(graph, act) {
   return graph.nodes.map((n, i) => ({
     key: 'node:' + n.id,
     ...(i < 9 ? { hotkey: String(i + 1) } : {}),
-    label: short(n.label, 16) + (n.sub ? ' ▸' : ''),
+    label: short(n.label, 16) + (n.sub ? ' ▸' : '') + (n.anchor ? ' ⚓' : ''),
     onPress: () => act?.drill(n.id),
   }))
 }
@@ -773,7 +982,13 @@ function paneItems(w, act) {
       for (const l of drawGraph(marked(graph), w)) add(l, { color: v.root === 'map' ? 'cyan' : undefined })
       out.push({ buttons: nodeButtons(graph, act) })
     } else if (node) {
-      add(S.loading.has(viewKey(v)) ? `… drawing the inside of ${node.label}` : `${node.label} has no detail yet.`, { dim: true })
+      if (node.anchor) {
+        add(`⚓ ${node.anchor}`, { bold: true })
+        const chunk = S.peek[node.anchor]
+        if (chunk?.error) add(`could not read: ${short(chunk.error, w - 18)}`, { dim: true })
+        else if (chunk) for (const l of chunk.lines) add(short(l, w), { color: 'green' })
+        else add('reading the code…', { dim: true })
+      } else add(S.loading.has(viewKey(v)) ? `… drawing the inside of ${node.label}` : `${node.label} has no detail yet.`, { dim: true })
     } else if (pin) {
       for (const l of pin.code.split('\n')) add(l, { dim: pin.kind === 'mermaid' })
     }
@@ -800,8 +1015,14 @@ function paneItems(w, act) {
   S.pins.forEach((p, i) => {
     if (i) add('')
     const what = p.graph ? `flowchart, ${p.graph.nodes.length} boxes` : p.kind === 'mermaid' ? 'mermaid' : 'box diagram'
-    const head = short(`${i + 1}. ${p.title || what} · turn ${p.turn}${p.edited ? ' · edited' : ''}`, w - 12)
-    out.push({ lead: head, buttons: [{ key: 'pin:' + i, label: 'open ▸', onPress: () => act?.openPin(p.code) }] })
+    const head = short(`${i + 1}. ${p.title || what} · turn ${p.turn}${p.edited ? ' · edited' : ''}`, w - 20)
+    out.push({
+      lead: head,
+      buttons: [
+        { key: 'pin:' + i, label: 'open ▸', onPress: () => act?.openPin(p.code) },
+        ...(p.file ? [{ key: 'unpin:' + i, label: 'unpin', onPress: () => act?.unpin(p.file) }] : []),
+      ],
+    })
     if (p.graph) for (const l of drawGraph(marked(p.graph, false), w)) add(l)
     else {
       // Not a flowchart we can draw: show the code as written, dimmed for mermaid

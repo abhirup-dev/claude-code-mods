@@ -6,3 +6,10 @@ plugins/*/.claude-plugin/types/
 node_modules/
 .DS_Store
 .idea
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
